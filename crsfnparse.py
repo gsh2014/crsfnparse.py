@@ -29,7 +29,7 @@ from model.pointer_net import PointerNet
 #this version of parse share the most of embedding matrix ,eg. field_embed type_embed ,which will be used by both the lay decoder and the final decoder 
 #next version of parse should take them apart 
 #   v 1.0 of crsfnparse
-@Registrable.register('')
+@Registrable.register('crsfn_parse')
 class Parser(nn.Module):
     """Implementation of a semantic parser
 
@@ -369,9 +369,10 @@ class Parser(nn.Module):
             action_prob.data.masked_fill_(action_mask_pad.data, 1.e-7)
 
             action_prob = action_prob.log() * action_mask
+        lay_scores = torch.sum(lay_action_prob,dim=0)
 
         scores = torch.sum(action_prob, dim=0)
-
+        scores += lay_scores 
         returns = [scores]
         if self.args.sup_attention:
             returns.append(att_prob)
@@ -689,7 +690,7 @@ class Parser(nn.Module):
             return att_vecs, att_probs
         else: return att_vecs
 
-    def parse(self, src_sent, context=None, beam_size=5, debug=False):
+    def parse(self, src_sent, context=None, beam_size=5, debug=False,lay_beam_size=5):
         """Perform beam search to infer the target AST given a source utterance
 
         Args:
@@ -1049,7 +1050,7 @@ class Parser(nn.Module):
 
                 a_tm1_embeds = []
                 for a_tm1 in actions_tm1:
-                    if a_tm1:
+                    if a_tm1:kaizuhuileshabi
                         if isinstance(a_tm1, ApplyRuleAction):
                             a_tm1_embed = self.production_embed.weight[self.grammar.prod2id[a_tm1.production]]
                         elif isinstance(a_tm1, ReduceAction):
