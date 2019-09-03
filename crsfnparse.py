@@ -26,9 +26,11 @@ from model.attention_util import AttentionUtil
 from model.nn_utils import LabelSmoothing
 from model.pointer_net import PointerNet
 
-
-@Registrable.register('default_parser')
-class Coarse2fineParser(nn.Module):
+#this version of parse share the most of embedding matrix ,eg. field_embed type_embed ,which will be used by both the lay decoder and the final decoder 
+#next version of parse should take them apart 
+#   v 1.0 of crsfnparse
+@Registrable.register('')
+class Parser(nn.Module):
     """Implementation of a semantic parser
 
     The parser translates a natural language utterance into an AST defined under
@@ -49,12 +51,15 @@ class Coarse2fineParser(nn.Module):
         self.src_embed = nn.Embedding(len(vocab.source), args.embed_size)
         # gsh lay production embedding 
         # XXX:should lay_pro_embed be replaced by production_embed
+        #work for the lay encoder 
         self.lay_pro_embed = nn.Embedding(len(transition_system.grammar)+1,args.action_embed_size)
 
 
         # embedding table of ASDL production rules (constructors), one for each ApplyConstructor action,
         # the last entry is the embedding for Reduce action
+        # TODO: gsh take len(transition_system.grammar)+1 as the number of ApplyRule action and Reduce 
         self.production_embed = nn.Embedding(len(transition_system.grammar) + 1, args.action_embed_size)
+        self.lay_production_embed = nn.Embedding(len(transition_system.grammar) + 1, args.action_embed_size)
 
         # embedding table for target primitive tokens
         self.primitive_embed = nn.Embedding(len(vocab.primitive), args.action_embed_size)
@@ -66,6 +71,8 @@ class Coarse2fineParser(nn.Module):
         self.type_embed = nn.Embedding(len(transition_system.grammar.types), args.type_embed_size)
 
         nn.init.xavier_normal(self.src_embed.weight.data)
+        nn.init.xavier_normal(self.lay_production_embed.data)
+        nn.init.xavier_normal(self.lay_pro_embed.data)
         nn.init.xavier_normal(self.production_embed.weight.data)
         nn.init.xavier_normal(self.primitive_embed.weight.data)
         nn.init.xavier_normal(self.field_embed.weight.data)
@@ -74,7 +81,7 @@ class Coarse2fineParser(nn.Module):
         # LSTMs
         if args.lstm == 'lstm':
             self.encoder_lstm = nn.LSTM(args.embed_size, int(args.hidden_size / 2), bidirectional=True)
-            self.lay_encoder_lstm = nn.LSTM(args.embed_size,int(args.hidden_size /2  ),bidirectional=True)
+            self.lay_encoder_lstm = nn.LSTM(args.embed_size, int(args.hidden_size /2  ),bidirectional=True)
 
             input_dim = args.action_embed_size  # previous action
             # frontier info
@@ -88,6 +95,7 @@ class Coarse2fineParser(nn.Module):
             self.decoder_lstm = nn.LSTMCell(input_dim, args.hidden_size)
         elif args.lstm == 'parent_feed':
             self.encoder_lstm = nn.LSTM(args.embed_size, int(args.hidden_size / 2), bidirectional=True)
+            self.lay_encoder_lstm = nn.LSTM(args.embed_size, int(args.hidden_size / 2), bidirectional=True)
             from .lstm import ParentFeedingLSTMCell
 
             input_dim = args.action_embed_size  # previous action
@@ -101,6 +109,32 @@ class Coarse2fineParser(nn.Module):
         else:
             raise ValueError('Unknown LSTM type %s' % args.lstm)
 
+        #laydecoder LSTM CELL
+        if args.lay_lstm == 'lstm':
+            input_dim = args.action_embed_size  # previous action
+            # frontier info
+            input_dim += args.action_embed_size * (not args.lay_no_parent_production_embed)
+            input_dim += args.field_embed_size * (not args.lay_no_parent_field_embed)
+            input_dim += args.type_embed_size * (not args.lay_no_parent_field_type_embed)
+            input_dim += args.hidden_size * (not args.lay_no_parent_state)
+
+            input_dim += args.att_vec_size * (not args.lay_no_input_feed)  # input feeding
+
+            self.lay_decoder_lstm = nn.LSTMCell(input_dim, args.hidden_size)
+        elif args.lay_lstm == 'parent_feed':
+            from .lstm import ParentFeedingLSTMCell
+
+            input_dim = args.action_embed_size  # previous action
+            # frontier info
+            input_dim += args.action_embed_size * (not args.lay_no_parent_production_embed)
+            input_dim += args.field_embed_size * (not args.lay_no_parent_field_embed)
+            input_dim += args.type_embed_size * (not args.lay_no_parent_field_type_embed)
+            input_dim += args.att_vec_size * (not args.lay_no_input_feed)  # input feeding
+
+            self.lay_decoder_lstm = ParentFeedingLSTMCell(input_dim, args.hidden_size)
+        else:
+            raise ValueError('Unknown LSTM type %s' % args.lstm)
+
         if args.no_copy is False:
             # pointer net for copying tokens from source side
             self.src_pointer_net = PointerNet(query_vec_size=args.att_vec_size, src_encoding_size=args.hidden_size)
@@ -111,10 +145,12 @@ class Coarse2fineParser(nn.Module):
             self.primitive_predictor = nn.Linear(args.att_vec_size, 2)
 
         if args.primitive_token_label_smoothing:
-            self.label_smoothing = LabelSmoothing(args.primitive_token_label_smoothing, len(self.vocab.primitive), ignore_indices=[0, 1, 2])
+            self.label_smoothing = LabelSmoothing(args.
+            primitive_token_label_smoothing, len(self.vocab.primitive), ignore_indices=[0, 1, 2])
 
         # initialize the decoder's state and cells with encoder hidden states
         self.decoder_cell_init = nn.Linear(args.hidden_size, args.hidden_size)
+        self.lay_decoder_cell_init = nn.Linear(args.hidden_size, args.hidden_size) 
 
         # attention: dot product attention
         # project source encoding to decoder rnn's hidden space
@@ -134,6 +170,7 @@ class Coarse2fineParser(nn.Module):
         # bias for predicting ApplyConstructor and GenToken actions
         self.production_readout_b = nn.Parameter(torch.FloatTensor(len(transition_system.grammar) + 1).zero_())
         self.tgt_token_readout_b = nn.Parameter(torch.FloatTensor(len(vocab.primitive)).zero_())
+        self.lay_production_readout_b = nn.Parameter(torch.FloatTensor(len(transition_system.grammar) + 1).zero_())
 
         if args.no_query_vec_to_action_map:
             # if there is no additional linear layer between the attentional vector (i.e., the query vector)
@@ -143,6 +180,7 @@ class Coarse2fineParser(nn.Module):
             assert args.att_vec_size == args.action_embed_size
             self.production_readout = lambda q: F.linear(q, self.production_embed.weight, self.production_readout_b)
             self.tgt_token_readout = lambda q: F.linear(q, self.primitive_embed.weight, self.tgt_token_readout_b)
+            self.lay_production_readout = lambda q: F.linear(q, self.lay_production_embed.weight, self.lay_production_readout_b)
         else:
             # by default, we feed the attentional vector (i.e., the query vector) into a linear layer without bias, and
             # compute action probabilities by dot-producting the resulting vector and (GenToken, ApplyConstructor) action embeddings
@@ -159,6 +197,8 @@ class Coarse2fineParser(nn.Module):
 
             self.production_readout = lambda q: F.linear(self.read_out_act(self.query_vec_to_action_embed(q)),
                                                          self.production_embed.weight, self.production_readout_b)
+            self.lay_production_readout = lambda q: F.linear(self.read_out_act(self.query_vec_to_action_embed(q)),
+                                                         self.lay_production_embed.weight, self.lay_production_readout_b)                                                         
             self.tgt_token_readout = lambda q: F.linear(self.read_out_act(self.query_vec_to_primitive_embed(q)),
                                                         self.primitive_embed.weight, self.tgt_token_readout_b)
 
@@ -216,12 +256,13 @@ class Coarse2fineParser(nn.Module):
 
         return src_encodings, (last_state, last_cell)
 
-    def init_decoder_state(self, enc_last_state, enc_last_cell):
+    def init_decoder_state(self, enc_last_state, enc_last_cell,for_lay_decoder=True):
         """Compute the initial decoder hidden state and cell state"""
-
-        h_0 = self.decoder_cell_init(enc_last_cell)
+        if for_lay_decoder is False:
+            h_0 = self.decoder_cell_init(enc_last_cell)
+        else: 
+            h_0 = self.lay_decoder_cell_init(enc_last_cell)    
         h_0 = F.tanh(h_0)
-
         return h_0, Variable(self.new_tensor(h_0.size()).zero_())
 
     def score(self, examples, return_encode_state=False):
@@ -237,18 +278,33 @@ class Coarse2fineParser(nn.Module):
 
         # src_encodings: (batch_size, src_sent_len, hidden_size * 2)
         # (last_state, last_cell, dec_init_vec): (batch_size, hidden_size)
-        src_encodings, (last_state, last_cell) = self.encode(batch.src_sents_var, batch.src_sents_len)
-        dec_init_vec = self.init_decoder_state(last_state, last_cell)
+        src_encodings, (last_state, last_cell) = self.encode(batch.src_sents_var, batch.src_sents_len,is_lay_encoder=False)
+        # add by gsh  lay_encoder
+        lay_encodings, (lay_last_state, lay_last_cell) = self.encode(batch.lay_action_var, batch.lay_actions_len)
+
+
+        dec_init_vec = self.init_decoder_state(last_state, last_cell,for_lay_decoder=False)
+        #add by gsh 
+        lay_dec_init_vec = self.init_decoder_state(last_state,last_cell)  
+        #add by gsh
+        lay_query_vectors = self.laydecode(batch ,src_encodings , lay_dec_init_vec)
 
         # query vectors are sufficient statistics used to compute action probabilities
         # query_vectors: (tgt_action_len, batch_size, hidden_size)
 
         # if use supervised attention
         if self.args.sup_attention:
+            #TODO:the second parameter should be discussed later
             query_vectors, att_prob = self.decode(batch, src_encodings, dec_init_vec)
         else:
             query_vectors = self.decode(batch, src_encodings, dec_init_vec)
+        
+        
+        lay_apply_rule_prob = F.softmax(self.lay_production_readout(lay_query_vectors),dim=-1)
 
+        tgt_lay_apply_rule_prob=torch.gather(lay_apply_rule_prob,dim=2 , index=batch.apply_lay_rule_idx_matrix.unsqueeze(2)).squeeze(2)
+
+        lay_action_prob = tgt_lay_apply_rule_prob.log()*batch.apply_lay_rule_mask
         # ApplyRule (i.e., ApplyConstructor) action probabilities
         # (tgt_action_len, batch_size, grammar_size)
         apply_rule_prob = F.softmax(self.production_readout(query_vectors), dim=-1)
@@ -323,7 +379,8 @@ class Coarse2fineParser(nn.Module):
 
         return returns
 
-    def step(self, x, h_tm1, src_encodings, src_encodings_att_linear, src_token_mask=None, return_att_weight=False):
+    def step(self, x, h_tm1, src_encodings, src_encodings_att_linear, src_token_mask=None, return_att_weight=False,is_lay_decoder=True):
+        #the last parameter is added by gsh for distinguishing the laydecoder lstm cell from the decoder lstm cell
         """Perform a single time-step of computation in decoder LSTM
 
         Args:
@@ -340,7 +397,9 @@ class Coarse2fineParser(nn.Module):
         """
 
         # h_t: (batch_size, hidden_size)
-        h_t, cell_t = self.decoder_lstm(x, h_tm1)
+        if is_lay_decoder:
+            h_t, cell_t = self.lay_decoder_lstm(x, h_tm1)
+        else: h_t, cell_t = self.decoder_lstm(x, h_tm1)
 
         ctx_t, alpha_t = nn_utils.dot_prod_attention(h_t,
                                                      src_encodings, src_encodings_att_linear,
@@ -464,7 +523,8 @@ class Coarse2fineParser(nn.Module):
             (h_t, cell_t), att_t, att_weight = self.step(x, h_tm1, src_encodings,
                                                          src_encodings_att_linear,
                                                          src_token_mask=batch.src_token_mask,
-                                                         return_att_weight=True)
+                                                         return_att_weight=True,
+                                                         is_lay_decoder=False)
 
             # if use supervised attention
             if args.sup_attention:
@@ -508,7 +568,7 @@ class Coarse2fineParser(nn.Module):
         batch_size = len(batch)
         args = self.args
 
-        if args.lstm == 'parent_feed':
+        if args.lay_lstm == 'parent_feed':
             h_tm1 = dec_init_vec[0], dec_init_vec[1], \
                     Variable(self.new_tensor(batch_size, args.hidden_size).zero_()), \
                     Variable(self.new_tensor(batch_size, args.hidden_size).zero_())
@@ -554,10 +614,10 @@ class Coarse2fineParser(nn.Module):
                     # action t - 1
                     if t < len(actions):
                         a_tm1 = actions[t - 1]
-                        #if isinstance(a_tm1.action, ApplyRuleAction):
-                        a_tm1_embed = self.production_embed.weight[self.grammar.prod2id[a_tm1.action.production]]
-                        #elif isinstance(a_tm1.action, ReduceAction):
-                            #a_tm1_embed = self.production_embed.weight[len(self.grammar)]
+                        if isinstance(a_tm1.action, ApplyRuleAction):
+                            a_tm1_embed = self.lay_production_embed.weight[self.grammar.prod2id[a_tm1.action.production]]
+                        elif isinstance(a_tm1.action, ReduceAction):
+                            a_tm1_embed = self.lay_production_embed.weight[len(self.grammar)]
                         #else:
                             #a_tm1_embed = self.primitive_embed.weight[self.vocab.primitive[a_tm1.action.token]]
                     else:
@@ -571,7 +631,7 @@ class Coarse2fineParser(nn.Module):
                 if args.lay_no_input_feed is False:
                     inputs.append(att_tm1)
                 if args.lay_no_parent_production_embed is False:
-                    parent_production_embed = self.production_embed(batch.get_frontier_prod_idx_lay(t))
+                    parent_production_embed = self.lay_production_embed(batch.get_frontier_prod_idx_lay(t))
                     inputs.append(parent_production_embed)
                 if args.lay_no_parent_field_embed is False:
                     parent_field_embed = self.field_embed(batch.get_frontier_field_idx_lay(t))
@@ -591,7 +651,7 @@ class Coarse2fineParser(nn.Module):
                                                 for batch_id, p_t in
                                                 enumerate(a_t.parent_t if a_t else 0 for a_t in actions_t)])
 
-                    if args.lstm == 'parent_feed':
+                    if args.lay_lstm == 'parent_feed':
                         h_tm1 = (h_tm1[0], h_tm1[1], parent_states, parent_cells)
                     else:
                         inputs.append(parent_states)
@@ -601,7 +661,8 @@ class Coarse2fineParser(nn.Module):
             (h_t, cell_t), att_t, att_weight = self.step(x, h_tm1, src_encodings,
                                                          src_encodings_att_linear,
                                                          src_token_mask=batch.src_token_mask,
-                                                         return_att_weight=True)
+                                                         return_att_weight=True,
+                                                         is_lay_decoder=True)
 
             # if use supervised attention
             # by gsh left for later consideration
@@ -643,16 +704,18 @@ class Coarse2fineParser(nn.Module):
         args = self.args
         primitive_vocab = self.vocab.primitive
         T = torch.cuda if args.cuda else torch
+        
 
         src_sent_var = nn_utils.to_input_variable([src_sent], self.vocab.source, cuda=args.cuda, training=False)
 
         # Variable(1, src_sent_len, hidden_size * 2)
-        src_encodings, (last_state, last_cell) = self.encode(src_sent_var, [len(src_sent)])
+        src_encodings, (last_state, last_cell) = self.encode(src_sent_var, [len(src_sent)], is_lay_encoder=False)
         # (1, src_sent_len, hidden_size)
-        src_encodings_att_linear = self.att_src_linear(src_encodings)
-
-        dec_init_vec = self.init_decoder_state(last_state, last_cell)
-        if args.lstm == 'parent_feed':
+        src_encodings_att_linear = self.lay_att_src_linear(src_encodings)
+ 
+        dec_init_vec = self.init_decoder_state(last_state, last_cell,for_lay_decoder=True)
+        
+        if args.lay_lstm == 'parent_feed':
             h_tm1 = dec_init_vec[0], dec_init_vec[1], \
                     Variable(self.new_tensor(args.hidden_size).zero_()), \
                     Variable(self.new_tensor(args.hidden_size).zero_())
@@ -660,6 +723,8 @@ class Coarse2fineParser(nn.Module):
             h_tm1 = dec_init_vec
 
         zero_action_embed = Variable(self.new_tensor(args.action_embed_size).zero_())
+        #added by gsh
+        lay_hyp_scores = Variable(self.new_tensor([0.]), volatile=True)
 
         hyp_scores = Variable(self.new_tensor([0.]), volatile=True)
 
@@ -670,9 +735,296 @@ class Coarse2fineParser(nn.Module):
             aggregated_primitive_tokens.setdefault(token, []).append(token_pos)
 
         t = 0
-        hypotheses = [DecodeHypothesis()]
+
+        lay_hypotheses = [DecodeHypothesis()] 
+        lay_hyp_states = [[]]
+        lay_completed_hypotheses = []  
+
+        hypotheses = [DecodeHypothesis()] 
         hyp_states = [[]]
         completed_hypotheses = []
+
+        #  lay decoder part      added by gsh
+        while len(lay_completed_hypotheses) < lay_beam_size and t < args.lay_decode_max_time_step:
+            hyp_num = len(lay_hypotheses)
+
+            # (hyp_num, src_sent_len, hidden_size * 2)
+            exp_src_encodings = src_encodings.expand(hyp_num, src_encodings.size(1), src_encodings.size(2))
+            # (hyp_num, src_sent_len, hidden_size)
+            exp_src_encodings_att_linear = src_encodings_att_linear.expand(hyp_num, src_encodings_att_linear.size(1), src_encodings_att_linear.size(2))
+
+            if t == 0:
+                x = Variable(self.new_tensor(1, self.decoder_lstm.input_size).zero_(), volatile=True)
+                if args.lay_no_parent_field_type_embed is False:
+                    offset = args.action_embed_size  # prev_action
+                    offset += args.att_vec_size * (not args.lay_no_input_feed)
+                    offset += args.action_embed_size * (not args.lay_no_parent_production_embed)
+                    offset += args.field_embed_size * (not args.lay_no_parent_field_embed)
+
+                    x[0, offset: offset + args.type_embed_size] = \
+                        self.type_embed.weight[self.grammar.type2id[self.grammar.root_type]]
+            else:
+                actions_tm1 = [hyp.actions[-1] for hyp in lay_hypotheses]
+
+                a_tm1_embeds = []
+                for a_tm1 in actions_tm1:
+                    if a_tm1:
+                        if isinstance(a_tm1, ApplyRuleAction):
+                            a_tm1_embed = self.lay_production_embed.weight[self.grammar.prod2id[a_tm1.production]]
+                        elif isinstance(a_tm1, ReduceAction):
+                            a_tm1_embed = self.lay_production_embed.weight[len(self.grammar)]
+                        else:
+                            print("neither applyruleaction or reduceaction")
+                           # a_tm1_embed = self.primitive_embed.weight[self.vocab.primitive[a_tm1.token]]
+
+                        a_tm1_embeds.append(a_tm1_embed)
+                    else:
+                        a_tm1_embeds.append(zero_action_embed)
+                a_tm1_embeds = torch.stack(a_tm1_embeds)
+
+                inputs = [a_tm1_embeds]
+                if args.lay_no_input_feed is False:
+                    inputs.append(att_tm1)
+                if args.lay_no_parent_production_embed is False:
+                    # frontier production
+                    frontier_prods = [hyp.frontier_node.production for hyp in lay_hypotheses]
+                    frontier_prod_embeds = self.lay_production_embed(Variable(self.new_long_tensor(
+                        [self.grammar.prod2id[prod] for prod in frontier_prods])))
+                    inputs.append(frontier_prod_embeds)
+                if args.lay_no_parent_field_embed is False:
+                    # frontier field
+                    frontier_fields = [hyp.frontier_field.field for hyp in lay_hypotheses]
+                    frontier_field_embeds = self.field_embed(Variable(self.new_long_tensor([
+                        self.grammar.field2id[field] for field in frontier_fields])))
+
+                    inputs.append(frontier_field_embeds)
+                if args.lay_no_parent_field_type_embed is False:
+                    # frontier field type
+                    frontier_field_types = [hyp.frontier_field.type for hyp in lay_hypotheses]
+                    frontier_field_type_embeds = self.type_embed(Variable(self.new_long_tensor([
+                        self.grammar.type2id[type] for type in frontier_field_types])))
+                    inputs.append(frontier_field_type_embeds)
+
+                # parent states
+                if args.lay_no_parent_state is False:
+                    p_ts = [hyp.frontier_node.created_time for hyp in lay_hypotheses]
+                    parent_states = torch.stack([lay_hyp_states[hyp_id][p_t][0] for hyp_id, p_t in enumerate(p_ts)])
+                    parent_cells = torch.stack([lay_hyp_states[hyp_id][p_t][1] for hyp_id, p_t in enumerate(p_ts)])
+
+                    if args.lay_lstm == 'parent_feed':
+                        h_tm1 = (h_tm1[0], h_tm1[1], parent_states, parent_cells)
+                    else:
+                        inputs.append(parent_states)
+
+                x = torch.cat(inputs, dim=-1)
+
+            (h_t, cell_t), att_t = self.step(x, h_tm1, exp_src_encodings,
+                                             exp_src_encodings_att_linear,
+                                             src_token_mask=None,
+                                             is_lay_decoder=True)
+
+            # Variable(batch_size, grammar_size)
+            # apply_rule_log_prob = torch.log(F.softmax(self.production_readout(att_t), dim=-1))
+            apply_rule_log_prob = F.log_softmax(self.lay_production_readout(att_t), dim=-1)
+
+            # Variable(batch_size, primitive_vocab_size)
+            #gen_from_vocab_prob = F.softmax(self.tgt_token_readout(att_t), dim=-1)
+
+            #if args.no_copy:
+            #    primitive_prob = gen_from_vocab_prob
+            #else:
+                # Variable(batch_size, src_sent_len)
+             #   primitive_copy_prob = self.src_pointer_net(src_encodings, None, att_t.unsqueeze(0)).squeeze(0)
+
+                # Variable(batch_size, 2)
+              #  primitive_predictor_prob = F.softmax(self.primitive_predictor(att_t), dim=-1)
+
+                # Variable(batch_size, primitive_vocab_size)
+               # primitive_prob = primitive_predictor_prob[:, 0].unsqueeze(1) * gen_from_vocab_prob
+
+                # if src_unk_pos_list:
+                #     primitive_prob[:, primitive_vocab.unk_id] = 1.e-10
+
+            #gentoken_prev_hyp_ids = []
+            #gentoken_new_hyp_unks = []
+            applyrule_new_hyp_scores = []
+            applyrule_new_hyp_prod_ids = []
+            applyrule_prev_hyp_ids = []
+
+            for hyp_id, hyp in enumerate(lay_hypotheses):
+                # generate new continuations
+                action_types = self.transition_system.get_valid_continuation_types(hyp)
+
+                for action_type in action_types:
+                    if action_type == ApplyRuleAction:
+                        productions = self.transition_system.get_valid_continuating_productions(hyp)
+                        for production in productions:
+                            prod_id = self.grammar.prod2id[production]
+                            prod_score = apply_rule_log_prob[hyp_id, prod_id].data[0]
+                            new_hyp_score = hyp.score + prod_score
+
+                            applyrule_new_hyp_scores.append(new_hyp_score)
+                            applyrule_new_hyp_prod_ids.append(prod_id)
+                            applyrule_prev_hyp_ids.append(hyp_id)
+                    elif action_type == ReduceAction:
+                        action_score = apply_rule_log_prob[hyp_id, len(self.grammar)].data[0]
+                        new_hyp_score = hyp.score + action_score
+
+                        applyrule_new_hyp_scores.append(new_hyp_score)
+                        applyrule_new_hyp_prod_ids.append(len(self.grammar))
+                        applyrule_prev_hyp_ids.append(hyp_id)
+                    else:
+                        print('Gentoken? there is some problems')
+                        # GenToken action
+                        # gentoken_prev_hyp_ids.append(hyp_id)
+                        # hyp_copy_info = dict()  # of (token_pos, copy_prob)
+                        # hyp_unk_copy_info = []
+
+                        # if args.no_copy is False:
+                        #     for token, token_pos_list in aggregated_primitive_tokens.items():
+                        #         sum_copy_prob = torch.gather(primitive_copy_prob[hyp_id], 0, Variable(T.LongTensor(token_pos_list))).sum()
+                        #         gated_copy_prob = primitive_predictor_prob[hyp_id, 1] * sum_copy_prob
+
+                        #         if token in primitive_vocab:
+                        #             token_id = primitive_vocab[token]
+                        #             primitive_prob[hyp_id, token_id] = p
+                        # rimitive_prob[hyp_id, token_id] + gated_copy_prob
+
+                        #             hyp_copy_info[token] = (token_pos_list, gated_copy_prob.data[0])
+                        #         else:
+                        #             hyp_unk_copy_info.append({'token': token, 'token_pos_list': token_pos_list,
+                        #                                       'copy_prob': gated_copy_prob.data[0]})
+
+                        # if args.no_copy is False and len(hyp_unk_copy_info) > 0:
+                        #     unk_i = np.array([x['copy_prob'] for x in hyp_unk_copy_info]).argmax()
+                        #     token = hyp_unk_copy_info[unk_i]['token']
+                        #     primitive_prob[hyp_id, primitive_vocab.unk_id] = hyp_unk_copy_info[unk_i]['copy_prob']
+                        #     gentoken_new_hyp_unks.append(token)
+
+                        #     hyp_copy_info[token] = (hyp_unk_copy_info[unk_i]['token_pos_list'], hyp_unk_copy_info[unk_i]['copy_prob'])
+
+            new_hyp_scores = None
+            if applyrule_new_hyp_scores:
+                new_hyp_scores = Variable(self.new_tensor(applyrule_new_hyp_scores))
+            # if gentoken_prev_hyp_ids:
+            #     primitive_log_prob = torch.log(primitive_prob)
+            #     gen_token_new_hyp_scores = (hyp_scores[gentoken_prev_hyp_ids].unsqueeze(1) + primitive_log_prob[gentoken_prev_hyp_ids, :]).view(-1)
+
+            #     if new_hyp_scores is None: new_hyp_scores = gen_token_new_hyp_scores
+            #     else: new_hyp_scores = torch.cat([new_hyp_scores, gen_token_new_hyp_scores])
+
+            top_new_hyp_scores, top_new_hyp_pos = torch.topk(new_hyp_scores,
+                                                             k=min(new_hyp_scores.size(0), beam_size - len(lay_completed_hypotheses)))
+
+            live_hyp_ids = []
+            new_hypotheses = []
+            for new_hyp_score, new_hyp_pos in zip(top_new_hyp_scores.data.cpu(), top_new_hyp_pos.data.cpu()):
+                action_info = ActionInfo()
+                if new_hyp_pos < len(applyrule_new_hyp_scores):
+                    # it's an ApplyRule or Reduce action
+                    prev_hyp_id = applyrule_prev_hyp_ids[new_hyp_pos]
+                    prev_hyp = hypotheses[prev_hyp_id]
+
+                    prod_id = applyrule_new_hyp_prod_ids[new_hyp_pos]
+                    # ApplyRule action
+                    if prod_id < len(self.grammar):
+                        production = self.grammar.id2prod[prod_id]
+                        action = ApplyRuleAction(production)
+                    # Reduce action
+                    else:
+                        action = ReduceAction()
+                else:
+                    print("this situation would not happen,there is no need to generate GenToken action")
+                    # # it's a GenToken action
+                    # token_id = (new_hyp_pos - len(applyrule_new_hyp_scores)) % primitive_prob.size(1)
+
+                    # k = (new_hyp_pos - len(applyrule_new_hyp_scores)) // primitive_prob.size(1)
+                    # # try:
+                    # # copy_info = gentoken_copy_infos[k]
+                    # prev_hyp_id = gentoken_prev_hyp_ids[k]
+                    # prev_hyp = hypotheses[prev_hyp_id]
+                    # # except:
+                    # #     print('k=%d' % k, file=sys.stderr)
+                    # #     print('primitive_prob.size(1)=%d' % primitive_prob.size(1), file=sys.stderr)
+                    # #     print('len copy_info=%d' % len(gentoken_copy_infos), file=sys.stderr)
+                    # #     print('prev_hyp_id=%s' % ', '.join(str(i) for i in gentoken_prev_hyp_ids), file=sys.stderr)
+                    # #     print('len applyrule_new_hyp_scores=%d' % len(applyrule_new_hyp_scores), file=sys.stderr)
+                    # #     print('len gentoken_prev_hyp_ids=%d' % len(gentoken_prev_hyp_ids), file=sys.stderr)
+                    # #     print('top_new_hyp_pos=%s' % top_new_hyp_pos, file=sys.stderr)
+                    # #     print('applyrule_new_hyp_scores=%s' % applyrule_new_hyp_scores, file=sys.stderr)
+                    # #     print('new_hyp_scores=%s' % new_hyp_scores, file=sys.stderr)
+                    # #     print('top_new_hyp_scores=%s' % top_new_hyp_scores, file=sys.stderr)
+                    # #
+                    # #     torch.save((applyrule_new_hyp_scores, primitive_prob), 'data.bin')
+                    # #
+                    # #     # exit(-1)
+                    # #     raise ValueError()
+
+                    # if token_id == primitive_vocab.unk_id:
+                    #     if gentoken_new_hyp_unks:
+                    #         token = gentoken_new_hyp_unks[k]
+                    #     else:
+                    #         token = primitive_vocab.id2word[primitive_vocab.unk_id]
+                    # else:
+                    #     token = primitive_vocab.id2word[token_id]
+
+                    # action = GenTokenAction(token)
+
+                    # if token in aggregated_primitive_tokens:
+                    #     action_info.copy_from_src = True
+                    #     action_info.src_token_position = aggregated_primitive_tokens[token]
+
+                    # if debug:
+                    #     action_info.gen_copy_switch = 'n/a' if args.no_copy else primitive_predictor_prob[prev_hyp_id, :].log().cpu().data.numpy()
+                    #     action_info.in_vocab = token in primitive_vocab
+                    #     action_info.gen_token_prob = gen_from_vocab_prob[prev_hyp_id, token_id].log().cpu().data[0] \
+                    #         if token in primitive_vocab else 'n/a'
+                    #     action_info.copy_token_prob = torch.gather(primitive_copy_prob[prev_hyp_id],
+                    #                                                0,
+                    #                                                Variable(T.LongTensor(action_info.src_token_position))).sum().log().cpu().data[0] \
+                    #         if args.no_copy is False and action_info.copy_from_src else 'n/a'
+
+                action_info.action = action
+                action_info.t = t
+                if t > 0:
+                    action_info.parent_t = prev_hyp.frontier_node.created_time
+                    action_info.frontier_prod = prev_hyp.frontier_node.production
+                    action_info.frontier_field = prev_hyp.frontier_field.field
+
+                if debug:
+                    action_info.action_prob = new_hyp_score - prev_hyp.score
+
+                new_hyp = prev_hyp.clone_and_apply_action_info(action_info)
+                new_hyp.score = new_hyp_score
+
+                if new_hyp.completed:
+                    lay_completed_hypotheses.append(new_hyp)
+                else:
+                    new_hypotheses.append(new_hyp)
+                    live_hyp_ids.append(prev_hyp_id)
+
+            if live_hyp_ids:
+                lay_hyp_states = [lay_hyp_states[i] + [(h_t[i], cell_t[i])] for i in live_hyp_ids]
+                h_tm1 = (h_t[live_hyp_ids], cell_t[live_hyp_ids])
+                att_tm1 = att_t[live_hyp_ids]
+                lay_hypotheses = new_hypotheses
+                lay_hyp_scores = Variable(self.new_tensor([hyp.score for hyp in hypotheses]))
+                t += 1
+            else:
+                break
+
+        #TODO:  
+        # 
+             
+        dec_init_vec = self.init_decoder_state(last_state, last_cell,for_lay_decoder=False)
+        src_encodings_att_linear = self.att_src_linear(src_encodings)
+
+        if args.lstm == 'parent_feed':
+            h_tm1 = dec_init_vec[0], dec_init_vec[1], \
+                    Variable(self.new_tensor(args.hidden_size).zero_()), \
+                    Variable(self.new_tensor(args.hidden_size).zero_())
+        else:
+            h_tm1 = dec_init_vec
 
         while len(completed_hypotheses) < beam_size and t < args.decode_max_time_step:
             hyp_num = len(hypotheses)
@@ -748,7 +1100,8 @@ class Coarse2fineParser(nn.Module):
 
             (h_t, cell_t), att_t = self.step(x, h_tm1, exp_src_encodings,
                                              exp_src_encodings_att_linear,
-                                             src_token_mask=None)
+                                             src_token_mask=None,
+                                             is_lay_decoder=False)
 
             # Variable(batch_size, grammar_size)
             # apply_rule_log_prob = torch.log(F.softmax(self.production_readout(att_t), dim=-1))
