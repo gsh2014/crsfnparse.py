@@ -29,7 +29,7 @@ from model.pointer_net import PointerNet
 #this version of parse share the most of embedding matrix ,eg. field_embed type_embed ,which will be used by both the lay decoder and the final decoder 
 #next version of parse should take them apart 
 #   v 1.0 of crsfnparse
-@Registrable.register('crsfn_parse')
+@Registrable.register('crsfn_parser')
 class Parser(nn.Module):
     """Implementation of a semantic parser
 
@@ -71,8 +71,8 @@ class Parser(nn.Module):
         self.type_embed = nn.Embedding(len(transition_system.grammar.types), args.type_embed_size)
 
         nn.init.xavier_normal(self.src_embed.weight.data)
-        nn.init.xavier_normal(self.lay_production_embed.data)
-        nn.init.xavier_normal(self.lay_pro_embed.data)
+        nn.init.xavier_normal(self.lay_production_embed.weight.data)
+        nn.init.xavier_normal(self.lay_pro_embed.weight.data)
         nn.init.xavier_normal(self.production_embed.weight.data)
         nn.init.xavier_normal(self.primitive_embed.weight.data)
         nn.init.xavier_normal(self.field_embed.weight.data)
@@ -598,7 +598,7 @@ class Parser(nn.Module):
             # ]
 
             if t == 0:
-                x = Variable(self.new_tensor(batch_size, self.decoder_lstm.input_size).zero_(), requires_grad=False)
+                x = Variable(self.new_tensor(batch_size, self.lay_decoder_lstm.input_size).zero_(), requires_grad=False)
 
                 # initialize using the root type embedding
                 if args.lay_no_parent_field_type_embed is False:
@@ -647,7 +647,7 @@ class Parser(nn.Module):
                     parent_states = torch.stack([history_states[p_t][0][batch_id]
                                                  for batch_id, p_t in
                                                  enumerate(a_t.parent_t if a_t else 0 for a_t in actions_t)])
-                                                # TODO: parent_t for lay is the same ?
+                                                # FIXME: parent_t for lay is the same ?
                     parent_cells = torch.stack([history_states[p_t][1][batch_id]
                                                 for batch_id, p_t in
                                                 enumerate(a_t.parent_t if a_t else 0 for a_t in actions_t)])
@@ -755,7 +755,7 @@ class Parser(nn.Module):
             exp_src_encodings_att_linear = src_encodings_att_linear.expand(hyp_num, src_encodings_att_linear.size(1), src_encodings_att_linear.size(2))
 
             if t == 0:
-                x = Variable(self.new_tensor(1, self.decoder_lstm.input_size).zero_(), volatile=True)
+                x = Variable(self.new_tensor(1, self.lay_decoder_lstm.input_size).zero_(), volatile=True)
                 if args.lay_no_parent_field_type_embed is False:
                     offset = args.action_embed_size  # prev_action
                     offset += args.att_vec_size * (not args.lay_no_input_feed)
@@ -854,7 +854,7 @@ class Parser(nn.Module):
 
             for hyp_id, hyp in enumerate(lay_hypotheses):
                 # generate new continuations
-                action_types = self.transition_system.get_valid_continuation_types(hyp)
+                action_types = self.transition_system.get_lay_valid_continuation_types(hyp)
 
                 for action_type in action_types:
                     if action_type == ApplyRuleAction:
@@ -915,7 +915,7 @@ class Parser(nn.Module):
             #     else: new_hyp_scores = torch.cat([new_hyp_scores, gen_token_new_hyp_scores])
 
             top_new_hyp_scores, top_new_hyp_pos = torch.topk(new_hyp_scores,
-                                                             k=min(new_hyp_scores.size(0), beam_size - len(lay_completed_hypotheses)))
+                                                             k=min(new_hyp_scores.size(0), beam_size- len(lay_completed_hypotheses)))
 
             live_hyp_ids = []
             new_hypotheses = []
@@ -924,7 +924,7 @@ class Parser(nn.Module):
                 if new_hyp_pos < len(applyrule_new_hyp_scores):
                     # it's an ApplyRule or Reduce action
                     prev_hyp_id = applyrule_prev_hyp_ids[new_hyp_pos]
-                    prev_hyp = hypotheses[prev_hyp_id]
+                    prev_hyp = lay_hypotheses[prev_hyp_id]
 
                     prod_id = applyrule_new_hyp_prod_ids[new_hyp_pos]
                     # ApplyRule action
@@ -995,7 +995,7 @@ class Parser(nn.Module):
                 if debug:
                     action_info.action_prob = new_hyp_score - prev_hyp.score
 
-                new_hyp = prev_hyp.clone_and_apply_action_info(action_info)
+                new_hyp = prev_hyp.clone_and_apply_lay_action_info(action_info)
                 new_hyp.score = new_hyp_score
 
                 if new_hyp.completed:
@@ -1009,7 +1009,7 @@ class Parser(nn.Module):
                 h_tm1 = (h_t[live_hyp_ids], cell_t[live_hyp_ids])
                 att_tm1 = att_t[live_hyp_ids]
                 lay_hypotheses = new_hypotheses
-                lay_hyp_scores = Variable(self.new_tensor([hyp.score for hyp in hypotheses]))
+                lay_hyp_scores = Variable(self.new_tensor([hyp.score for hyp in lay_hypotheses]))
                 t += 1
             else:
                 break
@@ -1026,7 +1026,7 @@ class Parser(nn.Module):
                     Variable(self.new_tensor(args.hidden_size).zero_())
         else:
             h_tm1 = dec_init_vec
-
+        t = 0
         while len(completed_hypotheses) < beam_size and t < args.decode_max_time_step:
             hyp_num = len(hypotheses)
 
@@ -1050,7 +1050,7 @@ class Parser(nn.Module):
 
                 a_tm1_embeds = []
                 for a_tm1 in actions_tm1:
-                    if a_tm1:kaizuhuileshabi
+                    if a_tm1:
                         if isinstance(a_tm1, ApplyRuleAction):
                             a_tm1_embed = self.production_embed.weight[self.grammar.prod2id[a_tm1.production]]
                         elif isinstance(a_tm1, ReduceAction):
