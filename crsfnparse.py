@@ -162,13 +162,14 @@ class CrsFnParser(nn.Module):
         
         #by gsh server for the lay decoder and attention mechanism
         self.lay_att_src_linear = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
-        self.lay_att_vec_linear = nn.Linear(args.hidden_size*2, args.att_vec_size, bias=False)
 
 
         # transformation of decoder hidden states and context vectors before reading out target words
         # this produces the `attentional vector` in (Luong et al., 2015)
 
         self.att_vec_linear = nn.Linear(args.hidden_size + args.hidden_size, args.att_vec_size, bias=False)
+        #add by gsh 
+        self.lay_att_vec_linear = nn.Linear(args.hidden_size*3, args.att_vec_size, bias=False)
 
         # bias for predicting ApplyConstructor and GenToken actions
         self.production_readout_b = nn.Parameter(torch.FloatTensor(len(transition_system.grammar) + 1).zero_())
@@ -303,9 +304,9 @@ class CrsFnParser(nn.Module):
         # if use supervised attention
         if self.args.sup_attention:
             #TODO:the second parameter should be discussed later
-            query_vectors, att_prob = self.decode(batch, src_encodings, dec_init_vec)
+            query_vectors, att_prob = self.decode(batch, src_encodings,lay_encodings, dec_init_vec)
         else:
-            query_vectors = self.decode(batch, src_encodings, dec_init_vec)
+            query_vectors = self.decode(batch, src_encodings,lay_encodings, dec_init_vec)
         
         
         lay_apply_rule_prob = F.softmax(self.lay_production_readout(lay_query_vectors),dim=-1)
@@ -388,7 +389,7 @@ class CrsFnParser(nn.Module):
 
         return returns
 
-    def step(self, x, h_tm1, src_encodings, src_encodings_att_linear, src_token_mask=None, return_att_weight=False,is_lay_decoder=True):
+    def step(self, x, h_tm1, src_encodings, src_encodings_att_linear, src_token_mask=None, lay_encodings=None,lay_encodings_att_linear=None,lay_action_mask=None,return_att_weight=False,is_lay_decoder=True):
         #the last parameter is added by gsh for distinguishing the laydecoder lstm cell from the decoder lstm cell
         """Perform a single time-step of computation in decoder LSTM
 
@@ -409,19 +410,25 @@ class CrsFnParser(nn.Module):
         if is_lay_decoder:
             h_t, cell_t = self.lay_decoder_lstm(x, h_tm1)
         else: h_t, cell_t = self.decoder_lstm(x, h_tm1)
+        if not is_lay_decoder:
+            lay_ctx_t, lay_alpha_t=nn_utils.dot_prod_attention( h_t,
+                                                                lay_encodings,lay_encodings_att_linear,
+                                                                mask=lay_action_mask)
 
         ctx_t, alpha_t = nn_utils.dot_prod_attention(h_t,
                                                      src_encodings, src_encodings_att_linear,
                                                      mask=src_token_mask)
-
-        att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))  # E.q. (5)
+        if is_lay_decoder:
+            att_t = F.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))  # E.q. (5)
+        else:
+            att_t = F.tanh(self.lay_att_vec_linear(torch.cat([h_t,ctx_t,lay_ctx_t],1)))
         att_t = self.dropout(att_t)
 
         if return_att_weight:
             return (h_t, cell_t), att_t, alpha_t
         else: return (h_t, cell_t), att_t
 
-    def decode(self, batch, src_encodings, dec_init_vec):
+    def decode(self, batch, src_encodings,lay_encodings, dec_init_vec):
         """Given a batch of examples and their encodings of input utterances,
         compute query vectors at each decoding time step, which are used to compute
         action probabilities
@@ -448,6 +455,7 @@ class CrsFnParser(nn.Module):
 
         # (batch_size, query_len, hidden_size)
         src_encodings_att_linear = self.att_src_linear(src_encodings)
+        lay_encodings_att_linear = self.lay_att_src_linear(lay_encodings)
 
         zero_action_embed = Variable(self.new_tensor(args.action_embed_size).zero_())
 
@@ -532,6 +540,9 @@ class CrsFnParser(nn.Module):
             (h_t, cell_t), att_t, att_weight = self.step(x, h_tm1, src_encodings,
                                                          src_encodings_att_linear,
                                                          src_token_mask=batch.src_token_mask,
+                                                         lay_encodings=lay_encodings,
+                                                         lay_encodings_att_linear=lay_encodings_att_linear,
+                                                         lay_action_mask=batch.lay_action_mask,
                                                          return_att_weight=True,
                                                          is_lay_decoder=False)
 
@@ -585,7 +596,7 @@ class CrsFnParser(nn.Module):
             h_tm1 = dec_init_vec
 
         # (batch_size, query_len, hidden_size)
-        src_encodings_att_linear = self.lay_att_src_linear(src_encodings)
+        src_encodings_att_linear = self.att_src_linear(src_encodings)
 
         zero_action_embed = Variable(self.new_tensor(args.action_embed_size).zero_())
 
@@ -720,7 +731,7 @@ class CrsFnParser(nn.Module):
         # Variable(1, src_sent_len, hidden_size * 2)
         src_encodings, (last_state, last_cell) = self.encode(src_sent_var, [len(src_sent)], is_lay_encoder=False)
         # (1, src_sent_len, hidden_size)
-        src_encodings_att_linear = self.lay_att_src_linear(src_encodings)
+        src_encodings_att_linear = self.att_src_linear(src_encodings)
  
         dec_init_vec = self.init_decoder_state(last_state, last_cell,for_lay_decoder=True)
         
@@ -1036,7 +1047,8 @@ class CrsFnParser(nn.Module):
 
 
         dec_init_vec = self.init_decoder_state(last_state, last_cell,lay_last_state,lay_last_cell,for_lay_decoder=False)
-        src_encodings_att_linear = self.att_src_linear(src_encodings)
+        #src_encodings_att_linear = self.att_src_linear(src_encodings)
+        lay_encodings_att_linear = self.lay_att_src_linear(lay_encodings)
 
         if args.lstm == 'parent_feed':
             h_tm1 = dec_init_vec[0], dec_init_vec[1], \
@@ -1044,14 +1056,19 @@ class CrsFnParser(nn.Module):
                     Variable(self.new_tensor(args.hidden_size).zero_())
         else:
             h_tm1 = dec_init_vec
+        
         t = 0
         while len(completed_hypotheses) < beam_size and t < args.decode_max_time_step:
             hyp_num = len(hypotheses)
 
             # (hyp_num, src_sent_len, hidden_size * 2)
             exp_src_encodings = src_encodings.expand(hyp_num, src_encodings.size(1), src_encodings.size(2))
+            exp_lay_encodings = lay_encodings.expand(hyp_num, lay_encodings.size(1), lay_encodings.size(2))
+            
             # (hyp_num, src_sent_len, hidden_size)
             exp_src_encodings_att_linear = src_encodings_att_linear.expand(hyp_num, src_encodings_att_linear.size(1), src_encodings_att_linear.size(2))
+            exp_lay_encodings_att_linear = lay_encodings_att_linear.expand(hyp_num, lay_encodings_att_linear.size(1), lay_encodings_att_linear.size(2))
+
 
             if t == 0:
                 x = Variable(self.new_tensor(1, self.decoder_lstm.input_size).zero_(), volatile=True)
@@ -1120,6 +1137,9 @@ class CrsFnParser(nn.Module):
             (h_t, cell_t), att_t = self.step(x, h_tm1, exp_src_encodings,
                                              exp_src_encodings_att_linear,
                                              src_token_mask=None,
+                                             lay_encodings=exp_lay_encodings,
+                                             lay_encodings_att_linear=exp_lay_encodings_att_linear,
+                                             lay_action_mask= None,                                          
                                              is_lay_decoder=False)
 
             # Variable(batch_size, grammar_size)
