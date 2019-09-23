@@ -30,14 +30,14 @@ from model.pointer_net import PointerNet
 #next version of parse should take them apart 
 #   v 1.0 of crsfnparse
 @Registrable.register('crsfn_parser')
-class Parser(nn.Module):
+class CrsFnParser(nn.Module):
     """Implementation of a semantic parser
 
     The parser translates a natural language utterance into an AST defined under
     the ASDL specification, using the transition system described in https://arxiv.org/abs/1810.02720
     """
     def __init__(self, args, vocab, transition_system):
-        super(Parser, self).__init__()
+        super(CrsFnParser, self).__init__()
 
         self.args = args
         self.vocab = vocab
@@ -150,7 +150,10 @@ class Parser(nn.Module):
 
         # initialize the decoder's state and cells with encoder hidden states
         self.decoder_cell_init = nn.Linear(args.hidden_size, args.hidden_size)
-        self.lay_decoder_cell_init = nn.Linear(args.hidden_size, args.hidden_size) 
+        self.mix_state=nn.Linear(args.hidden_size*2,args.hidden_size)
+
+        self.mix_cell=nn.Linear(args.hidden_size*2,args.hidden_size)
+
 
         # attention: dot product attention
         # project source encoding to decoder rnn's hidden space
@@ -234,7 +237,7 @@ class Parser(nn.Module):
             mask = Variable(self.new_tensor(src_sents_var.size()).fill_(1. - self.args.word_dropout).bernoulli().long())
             src_sents_var = src_sents_var * mask + (1 - mask) * self.vocab.source.unk_id
 
-        if is_lay_encoder:
+        if is_lay_encoder: 
             token_embed=self.lay_pro_embed(src_sents_var)
         else:
             token_embed = self.src_embed(src_sents_var)
@@ -247,7 +250,7 @@ class Parser(nn.Module):
         else: 
             src_encodings,(last_state, last_cell) = self.lay_encoder_lstm(packed_src_token_embed)
         src_encodings, _ = pad_packed_sequence(src_encodings)
-        # src_encodings: (batch_size, tgt_query_len, hidden_size)
+        # src_encodings: (batch_size, tgt_query_len, hidden_size) 
         src_encodings = src_encodings.permute(1, 0, 2)
 
         # (batch_size, hidden_size * 2)
@@ -256,14 +259,19 @@ class Parser(nn.Module):
 
         return src_encodings, (last_state, last_cell)
 
-    def init_decoder_state(self, enc_last_state, enc_last_cell,for_lay_decoder=True):
+    def init_decoder_state(self, enc_last_state, enc_last_cell,lay_last_state=None,lay_last_cell=None,for_lay_decoder=True):
         """Compute the initial decoder hidden state and cell state"""
         if for_lay_decoder is False:
-            h_0 = self.decoder_cell_init(enc_last_cell)
+            last_state = torch.cat((enc_last_state,lay_last_state),1)
+            last_cell = torch.cat((enc_last_cell,lay_last_cell),1)
+            h_0 = self.mix_state(last_state)
+            h_1=self.mix_cell(last_cell)
+            h_1=F.tanh(h_1)
         else: 
-            h_0 = self.lay_decoder_cell_init(enc_last_cell)    
+            h_0 = self.decoder_cell_init(enc_last_cell) 
+            h_1 = Variable(self.new_tensor(h_0.size()).zero_())
         h_0 = F.tanh(h_0)
-        return h_0, Variable(self.new_tensor(h_0.size()).zero_())
+        return h_0, h_1
 
     def score(self, examples, return_encode_state=False):
         """Given a list of examples, compute the log-likelihood of generating the target AST
@@ -283,7 +291,7 @@ class Parser(nn.Module):
         lay_encodings, (lay_last_state, lay_last_cell) = self.encode(batch.lay_action_var, batch.lay_actions_len)
 
 
-        dec_init_vec = self.init_decoder_state(last_state, last_cell,for_lay_decoder=False)
+        dec_init_vec = self.init_decoder_state(last_state, last_cell,lay_last_state,lay_last_cell,for_lay_decoder=False)
         #add by gsh 
         lay_dec_init_vec = self.init_decoder_state(last_state,last_cell)  
         #add by gsh
@@ -1015,9 +1023,19 @@ class Parser(nn.Module):
                 break
 
         #TODO:  
-        # 
-             
-        dec_init_vec = self.init_decoder_state(last_state, last_cell,for_lay_decoder=False)
+        if len(lay_completed_hypotheses)==0:
+            lay_hypotheses.sort(key=lambda hyp: -hyp.score)
+            lay_actions = lay_hypotheses[0].action_infos
+        else:
+            lay_completed_hypotheses.sort(key=lambda hyp:-hyp.score)
+            lay_actions=lay_completed_hypotheses[0].action_infos
+        
+        lay_action_var=nn_utils.to_lay_input_variable([lay_actions],self.grammar, cuda=args.cuda,training=False )
+        
+        lay_encodings,(lay_last_state,lay_last_cell)=self.encode(lay_action_var,[len(lay_actions)])
+
+
+        dec_init_vec = self.init_decoder_state(last_state, last_cell,lay_last_state,lay_last_cell,for_lay_decoder=False)
         src_encodings_att_linear = self.att_src_linear(src_encodings)
 
         if args.lstm == 'parent_feed':
